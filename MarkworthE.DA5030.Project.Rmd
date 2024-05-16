@@ -1,0 +1,708 @@
+---
+title: "Using an Ensemble Model to Predict Bike Share Demand in Seoul"
+author: "Eli Markworth"
+date: "December 2023"
+output:
+  html_document:
+    toc: true
+    theme: united
+---
+
+In this project, I will be examining the Seoul Bike Sharing Demand data set from the UCI Machine Learning Repository. I will be making an ensemble model using kNN, linear regression, and decision tree regression to predict the number of bike-share bikes rented in any given hour in Seoul, South Korea. The data set contains information about the number of bikes rented per hour for each day from December 2017 to the end of November 2018. There is also information on weather and holiday status for each entry.
+
+## Data Aquisition
+```{r libraries, include=FALSE, echo=FALSE}
+library(tidyverse)
+library(psych)
+library(ggcorrplot)
+library(factoextra)
+library(caret)
+library(rpart)
+library(ipred)
+
+set.seed(12345)
+```
+The libraries I am using are being loaded in a hidden code chunk.
+
+```{r loadData, include=FALSE}
+bikedata <- read_csv("SeoulBikeData.csv", 
+                     col_names = TRUE, 
+                     local = locale(encoding = "latin1"))
+
+# Check if loaded in properly
+head(bikedata)
+```
+To load the data in, I am using `read_csv` from the tidyverse, as I will be using many more tidyverse functions later on. This also allows me to set the language encoding to be compatible, as the data was collected from a country that does not use the Latin alphabet. I used `str` and `head` to make sure it loaded in all the variables and cells correctly.
+
+## Data Exploration
+```{r overview}
+str(bikedata)
+
+bikedata.tf <- bikedata
+
+for (i in c(2,4,5,6,7,8,9,10,11)) {
+  bikedata.tf[,i] <- scale(bikedata[,i])
+}
+```
+Doing a quick overview of the data with `str`, we see that the `Date` variable in a character type. I will need to change this to a proper date/time format. The variables `Seasons`, `Holiday`, and `Functioning Day` are all as characters, but would be better as factors. I am normalizing my continuous features now so that my examination of the data will be more meaningful. The normalized data is going in a tibble `bikedata.tf`.
+
+```{r Date_and_Hour}
+bikedata$Date <- dmy(bikedata$Date)
+bikedata.tf$Date <- dmy(bikedata.tf$Date)
+summary(bikedata.tf$Date)
+
+bikedata %>%
+  group_by(Hour) %>%
+  summarize(sum(n = n()))
+```
+I changed the date entries to a proper date format: year, month, day. We can see that the first day in the data set in the first of December 2017, and the last day is November 30th, 2018. This means we have no erroneous dates added to the data set and there are complete sets of hours for each day.
+
+```{r Hists, include=FALSE, echo=FALSE}
+hist(bikedata.tf$`Rented Bike Count`)
+hist(bikedata.tf$`Temperature(°C)`)
+hist(bikedata.tf$`Humidity(%)`)
+hist(bikedata.tf$`Wind speed (m/s)`)
+hist(bikedata.tf$`Visibility (10m)`)
+hist(bikedata.tf$`Dew point temperature(°C)`)
+hist(bikedata.tf$`Solar Radiation (MJ/m2)`)
+hist(bikedata.tf$`Rainfall(mm)`)
+hist(bikedata.tf$`Snowfall (cm)`)
+```
+
+The distribution of Rented Bike Counts, Visibility, Solar radiation, Rainfall, and Snowfall all look like they may not be normally distributed when plotted in histograms. The others look normally distributed enough that they will be suitable for our linear regression model. The kNN and Decision Tree models will be robust to non-normally distributed data, and the linear regression needs a close enough distribution. There is no exact cutoff of normal to non-normal distribution which makes a linear regression model stop working. It will work better or worse, but either way it will make predictions.
+
+```{r Shapwilk, include=FALSE, echo=FALSE}
+shapiro.test(sample(bikedata.tf$`Rented Bike Count`, size = 5000))$p.value
+shapiro.test(sample(bikedata.tf$`Wind speed (m/s)`, size = 5000))$p.value
+shapiro.test(sample(bikedata.tf$`Visibility (10m)`, size = 5000))$p.value
+shapiro.test(sample(bikedata.tf$`Solar Radiation (MJ/m2)`, size = 5000))$p.value
+shapiro.test(sample(bikedata.tf$`Rainfall(mm)`, size = 5000))$p.value
+shapiro.test(sample(bikedata.tf$`Snowfall (cm)`, size = 5000))$p.value
+```
+We can evaluate the non-normality of the data using a Shapiro-Wilk test. The variables Rented Bike Count, Wind Speed, Visibility, Solar Radiation, Rainfall, and Snowfall are significantly non-normal. I did not include the data that looked normally distributed enough in the histogram chunk, as those are good enough for linear regression. I had to test only a sample of the data because the Shapiro-Wilk test can only handle a vector up to 5000, and our data is greater.
+```{r colinearity}
+pairs.panels(bikedata.tf[,c(2,4,5,6,7,8,9,10,11)])
+```
+
+We can check the co-linearity of the variables with the `pairs.panels` function. We see that many of the variables have weak relationships with each other. Some that do stick out are Rented Bike Count with Temperature, Temperature with Dewpoint Temp., and Humidity with Temp. and Visibility. There is high correlation in those variables, which could cause problems.
+
+```{r outliers}
+# I'm keeping Rented Bike Count observations that are outliers, as it is the dependent variable
+for (i in 4:11) {
+  bikedata.tf <- bikedata.tf[which(bikedata.tf[,i] < 3 & bikedata.tf[,i] > -3), ]
+}
+```
+I am removing observations with outliers which are defined as more than 3 standard deviations from the mean. I am using this definition because others, such as using 1.5 times the inter quartile range, would remove too many values from our features which are not normally distributed.
+
+```{r factorize}
+bikedata.tf$Seasons <- as.factor(bikedata.tf$Seasons)
+table(bikedata.tf$Seasons)
+
+bikedata.tf$Holiday <- as.factor(bikedata.tf$Holiday)
+table(bikedata.tf$Holiday)
+
+bikedata.tf$`Functioning Day` <- as.factor(bikedata.tf$`Functioning Day`)
+table(bikedata.tf$`Functioning Day`)
+```
+By turning all the character features into factors, I can double check that they are entered in correctly by using the `table` function. It does not look like there are any typos.
+
+## Data Cleaning and Shaping
+```{r NAdetection}
+for (i in 1:ncol(bikedata.tf)) {
+  nas <- length(which(is.na(bikedata.tf[,i]) == TRUE))
+  print(paste("Feature", i, "has", nas, "NA values."))
+}
+
+for (i in c(2, 4:11)) {
+  na_inds <- sample(1:nrow(bikedata.tf), size = floor(0.05 * nrow(bikedata.tf)))
+  bikedata.tf[na_inds,i] <- NA
+}
+```
+The source of this data set notes that there are no missing values in the data, but I like double checking. None of the features have missing/NA values. Because there are no missing values, I will remove some at random to show how to deal with them. I convert 5% of values in continuous variables to NAs. I am not converting values in categorical variables because those variables are things like Date, Hour, and Season, which are integral to the way the data is collected. They would therefore only be missing in extreme cases. If there are missing values, their replacement would be easy to determine given the context of the data but that replacement would be repetitive/simple enough that it would be inappropriate to include in this project (I would likely manually impute those data).
+
+```{r NAimpute}
+bikedata.tf$`Rented Bike Count`[is.na(bikedata.tf$`Rented Bike Count`)] <- median(bikedata.tf$`Rented Bike Count`, na.rm = T) 
+
+bikedata.tf$`Temperature(°C)`[is.na(bikedata.tf$`Temperature(°C)`)] <- median(bikedata.tf$`Temperature(°C)`, na.rm = T) 
+
+bikedata.tf$`Humidity(%)`[is.na(bikedata.tf$`Humidity(%)`)] <- median(bikedata.tf$`Humidity(%)`, na.rm = T) 
+
+bikedata.tf$`Wind speed (m/s)`[is.na(bikedata.tf$`Wind speed (m/s)`)] <- median(bikedata.tf$`Wind speed (m/s)`, na.rm = T) 
+
+bikedata.tf$`Visibility (10m)`[is.na(bikedata.tf$`Visibility (10m)`)] <- median(bikedata.tf$`Visibility (10m)`, na.rm = T) 
+
+bikedata.tf$`Dew point temperature(°C)`[is.na(bikedata.tf$`Dew point temperature(°C)`)] <- median(bikedata.tf$`Dew point temperature(°C)`, na.rm = T) 
+
+bikedata.tf$`Solar Radiation (MJ/m2)`[is.na(bikedata.tf$`Solar Radiation (MJ/m2)`)] <- median(bikedata.tf$`Solar Radiation (MJ/m2)`, na.rm = T) 
+
+bikedata.tf$`Rainfall(mm)`[is.na(bikedata.tf$`Rainfall(mm)`)] <- median(bikedata.tf$`Rainfall(mm)`, na.rm = T) 
+
+bikedata.tf$`Snowfall (cm)`[is.na(bikedata.tf$`Snowfall (cm)`)] <- median(bikedata.tf$`Snowfall (cm)`, na.rm = T) 
+```
+I am imputing the data by median, as mean imputation would further skew data in features not normally distributed.
+
+```{r dummyEncoding}
+encSeasons <- model.matrix(~bikedata.tf$Seasons - 1)
+encHoliday <- model.matrix(~bikedata.tf$Holiday - 1)
+encFuncDay <- model.matrix(~bikedata.tf$`Functioning Day` - 1)
+
+bikedata.en <- bikedata.tf[,1:11]
+
+bikedata.en <- cbind(bikedata.en, encSeasons, encHoliday, encFuncDay)
+```
+Our kNN model needs its categorical variables dummy encoded. I am making a new data frame that holds the dummy values so that I don't have to do any column selection with the models that don't need the encoded values. I am using the `model.matrix` function to create simple dummy encoding. 
+
+```{r transformationRBC, include=FALSE, echo=FALSE}
+# Rented Bike Count (RBC) is right skewed, not normally distributed
+hist(bikedata.tf$`Rented Bike Count`)
+# Not normally distributed across different sample sizes
+shapiro.test(sample(bikedata.tf$`Rented Bike Count`, size = 5000))$p.value
+shapiro.test(sample(bikedata.tf$`Rented Bike Count`, size = 500))$p.value
+
+#------------------------------------------------------------------------------#
+# Square root transform looks slightly better
+hist(sqrt(bikedata.tf$`Rented Bike Count` + 2))
+# Distribution can be detected as getting more normally distributed at lower sample sizes
+shapiro.test(sample(sqrt(bikedata.tf$`Rented Bike Count` + 
+                           abs(min(bikedata.tf$`Rented Bike Count`)) + 1), size = 5000))$p.value
+shapiro.test(sample(sqrt(bikedata.tf$`Rented Bike Count` +
+                           abs(min(bikedata.tf$`Rented Bike Count`)) + 1), size = 500))$p.value
+# Compare transforms at lower sample sizes to get better distributions
+
+#------------------------------------------------------------------------------#
+# Log transforms
+hist(log(bikedata.tf$`Rented Bike Count` + 2))
+
+# Smaller offset seems better
+shapiro.test(sample(log(bikedata.tf$`Rented Bike Count` + abs(min(bikedata.tf$`Rented Bike Count`)) + 1), 
+                    size = 500))$p.value
+shapiro.test(sample(log(bikedata.tf$`Rented Bike Count` + 2), size = 500))$p.value
+shapiro.test(sample(log(bikedata.tf$`Rented Bike Count` + 5), size = 500))$p.value
+
+# Similar to others
+shapiro.test(sample(log10(bikedata.tf$`Rented Bike Count` + abs(min(bikedata.tf$`Rented Bike Count`)) + 1), size = 500))$p.value
+shapiro.test(sample(log2(bikedata.tf$`Rented Bike Count` + abs(min(bikedata.tf$`Rented Bike Count`)) + 1), size = 500))$p.value
+
+#------------------------------------------------------------------------------#
+# Inverse transform
+hist(1/bikedata.tf$`Rented Bike Count`)
+shapiro.test(sample(1/(bikedata.tf$`Rented Bike Count`), size = 500))$p.value
+
+#------------------------------------------------------------------------------#
+# Transform data using log and small offset
+bikedata.en$`Rented Bike Count` <- log(bikedata.tf$`Rented Bike Count` + 
+                                         abs(min(bikedata.tf$`Rented Bike Count`)) + 1)
+bikedata.tf$`Rented Bike Count` <- log(bikedata.tf$`Rented Bike Count` + 
+                                         abs(min(bikedata.tf$`Rented Bike Count`)) + 1)
+```
+To transform our first variable `Rented Bike Count` (RBC) into a distribution that is more normal, I am going to try square-root, log, and inverse transformation methods. The RBC data looks slightly skewed right. When I assess its normality using the Shapiro-Wilk test, it is non-normal at sampling sizes of 5000 and 500. With a square root transformation, we can detect a slight improvement in the normality, as the p-value increases very slightly. From this, it seems that if I wish to detect if any of my transformations improve the data, I'll need to use a smaller sample size (500). I am using an offset on the data for the square root and log transformations, as those functions are incompatible with certain values such as negatives and 0. Using a log transformation, it seems two of the transformations are better the square-root transformation in terms of propensity to increase the normality of the data - the smaller offsets. The inverse transformation seems inappropriate for this data. The best transform in this case is the log with small offset.
+
+```{r transformWindS, include=FALSE, echo=FALSE}
+hist(bikedata.tf$`Wind speed (m/s)`)
+shapiro.test(sample(bikedata.tf$`Wind speed (m/s)`, size = 5000))$p.value
+shapiro.test(sample(bikedata.tf$`Wind speed (m/s)`, size = 500))$p.value
+
+# Sqrt
+hist(sqrt(bikedata.tf$`Wind speed (m/s)` + abs(min(bikedata.tf$`Wind speed (m/s)`)) + 1))
+shapiro.test(sample(sqrt(bikedata.tf$`Wind speed (m/s)` + abs(min(bikedata.tf$`Wind speed (m/s)`)) + 1),
+                    size = 5000))$p.value
+shapiro.test(sample(sqrt(bikedata.tf$`Wind speed (m/s)` + abs(min(bikedata.tf$`Wind speed (m/s)`)) + 1), 
+                    size = 500))$p.value
+
+# log
+hist(log(bikedata.tf$`Wind speed (m/s)` + abs(min(bikedata.tf$`Wind speed (m/s)`)) + 1))
+shapiro.test(sample(log(bikedata.tf$`Wind speed (m/s)` + abs(min(bikedata.tf$`Wind speed (m/s)`)) + 1),
+                    size = 5000))$p.value
+shapiro.test(sample(log(bikedata.tf$`Wind speed (m/s)` + abs(min(bikedata.tf$`Wind speed (m/s)`)) + 1), 
+                    size = 500))$p.value
+
+# Inverse
+hist(1/bikedata.tf$`Wind speed (m/s)` + abs(min(bikedata.tf$`Wind speed (m/s)`)))
+shapiro.test(sample(1/(bikedata.tf$`Wind speed (m/s)` + abs(min(bikedata.tf$`Wind speed (m/s)`))),
+                    size = 5000))$p.value
+shapiro.test(sample(1/(bikedata.tf$`Wind speed (m/s)` + abs(min(bikedata.tf$`Wind speed (m/s)`))), 
+                    size = 500))$p.value
+
+#------------------------------------------------------------------------------#
+# Transform data using log and small offset
+bikedata.en$`Wind speed (m/s)` <- log(bikedata.tf$`Wind speed (m/s)` + 
+                                        abs(min(bikedata.tf$`Wind speed (m/s)`)) + 1)
+bikedata.tf$`Wind speed (m/s)` <- log(bikedata.tf$`Wind speed (m/s)` + 
+                                        abs(min(bikedata.tf$`Wind speed (m/s)`)) + 1)
+```
+Similar to how I approached transforming the RBC variable, I assessed each transformation for the Wind Speed variable by Shapiro-Wilk p-value. The log transformation worked best, and I did not choose any other offset, as the data should behave the same way due to its right skew.
+
+```{r transformVis, include=FALSE, echo=FALSE}
+hist(bikedata.tf$`Visibility (10m)`)
+shapiro.test(sample(bikedata.tf$`Visibility (10m)`, size = 5000))$p.value
+shapiro.test(sample(bikedata.tf$`Visibility (10m)`, size = 500))$p.value
+
+# Sqrt
+hist(sqrt(bikedata.tf$`Visibility (10m)` + abs(min(bikedata.tf$`Visibility (10m)`)) + 1))
+shapiro.test(sample(sqrt(bikedata.tf$`Visibility (10m)` + abs(min(bikedata.tf$`Visibility (10m)`)) + 1),
+                    size = 5000))$p.value
+shapiro.test(sample(sqrt(bikedata.tf$`Visibility (10m)` + abs(min(bikedata.tf$`Visibility (10m)`)) + 1), 
+                    size = 500))$p.value
+
+# log
+hist(log(bikedata.tf$`Visibility (10m)` + abs(min(bikedata.tf$`Visibility (10m)`)) + 1))
+shapiro.test(sample(log(bikedata.tf$`Visibility (10m)` + abs(min(bikedata.tf$`Visibility (10m)`)) + 1),
+                    size = 5000))$p.value
+shapiro.test(sample(log(bikedata.tf$`Visibility (10m)` + abs(min(bikedata.tf$`Visibility (10m)`)) + 1),
+                    size = 500))$p.value
+
+# Inverse
+hist(1/(bikedata.tf$`Visibility (10m)`))
+shapiro.test(sample(1/(bikedata.tf$`Visibility (10m)` + abs(min(bikedata.tf$`Visibility (10m)`))),
+                    size = 5000))$p.value
+shapiro.test(sample(1/(bikedata.tf$`Visibility (10m)` + abs(min(bikedata.tf$`Visibility (10m)`))), 
+                    size = 500))$p.value
+```
+None of the transformations I explored for the Visibility variable were sufficient at normalizing the Visibility data. I will have to continue with imperfect data.
+
+```{r transformSolRad, include=FALSE, echo=FALSE}
+hist(bikedata.tf$`Solar Radiation (MJ/m2)`)
+shapiro.test(sample(bikedata.tf$`Solar Radiation (MJ/m2)`, size = 5000))$p.value
+shapiro.test(sample(bikedata.tf$`Solar Radiation (MJ/m2)`, size = 500))$p.value
+
+# log transform
+hist(log(bikedata.tf$`Solar Radiation (MJ/m2)` + abs(min(bikedata.tf$`Solar Radiation (MJ/m2)`)) + 1))
+shapiro.test(sample(log(bikedata.tf$`Solar Radiation (MJ/m2)` + 
+                          abs(min(bikedata.tf$`Solar Radiation (MJ/m2)`)) + 1), size = 5000))$p.value
+shapiro.test(sample(log(bikedata.tf$`Solar Radiation (MJ/m2)` + 
+                          abs(min(bikedata.tf$`Solar Radiation (MJ/m2)`)) + 1), size = 500))$p.value
+
+# Sqrt transform
+hist(sqrt(bikedata.tf$`Solar Radiation (MJ/m2)` + abs(min(bikedata.tf$`Solar Radiation (MJ/m2)`)) + 1))
+shapiro.test(sample(sqrt(bikedata.tf$`Solar Radiation (MJ/m2)` + 
+                          abs(min(bikedata.tf$`Solar Radiation (MJ/m2)`)) + 1), size = 5000))$p.value
+shapiro.test(sample(sqrt(bikedata.tf$`Solar Radiation (MJ/m2)` + 
+                          abs(min(bikedata.tf$`Solar Radiation (MJ/m2)`)) + 1), size = 500))$p.value
+
+# Inverse
+hist(1/(bikedata.tf$`Solar Radiation (MJ/m2)` ))
+shapiro.test(sample(1/(bikedata.tf$`Solar Radiation (MJ/m2)`), size = 5000))$p.value
+shapiro.test(sample(1/(bikedata.tf$`Solar Radiation (MJ/m2)`), size = 500))$p.value
+```
+Likewise with the prior transformation, no transformations were able to normalize the Solar Radiation data.
+
+```{r transformRain, include=FALSE, echo=FALSE}
+hist(bikedata.tf$`Rainfall(mm)`)
+shapiro.test(sample(bikedata.tf$`Rainfall(mm)`, size = 5000))$p.value
+shapiro.test(sample(bikedata.tf$`Rainfall(mm)`, size = 500))$p.value
+
+# log transform
+hist(log(bikedata.tf$`Rainfall(mm)` + abs(min(bikedata.tf$`Rainfall(mm)`)) + 1))
+shapiro.test(sample(log(bikedata.tf$`Rainfall(mm)` + 
+                          abs(min(bikedata.tf$`Rainfall(mm)`)) + 1), size = 5000))$p.value
+shapiro.test(sample(log(bikedata.tf$`Rainfall(mm)` + 
+                          abs(min(bikedata.tf$`Rainfall(mm)`)) + 1), size = 500))$p.value
+
+# Sqrt transform
+hist(sqrt(bikedata.tf$`Rainfall(mm)` + abs(min(bikedata.tf$`Rainfall(mm)`)) + 1))
+shapiro.test(sample(sqrt(bikedata.tf$`Rainfall(mm)` + 
+                          abs(min(bikedata.tf$`Rainfall(mm)`)) + 1), size = 5000))$p.value
+shapiro.test(sample(sqrt(bikedata.tf$`Rainfall(mm)` + 
+                          abs(min(bikedata.tf$`Rainfall(mm)`)) + 1), size = 500))$p.value
+
+# Inverse
+hist(1/(bikedata.tf$`Rainfall(mm)`))
+shapiro.test(sample(1/(bikedata.tf$`Rainfall(mm)` ), size = 5000))$p.value
+shapiro.test(sample(1/(bikedata.tf$`Rainfall(mm)`), size = 500))$p.value
+```
+This is the same for the Rainfall variable.
+
+```{r transformSnow, include=FALSE, echo=FALSE}
+hist(bikedata.tf$`Snowfall (cm)`)
+shapiro.test(sample(bikedata.tf$`Snowfall (cm)`, size = 5000))$p.value
+shapiro.test(sample(bikedata.tf$`Snowfall (cm)`, size = 500))$p.value
+
+# log transform
+hist(log(bikedata.tf$`Snowfall (cm)` + abs(min(bikedata.tf$`Snowfall (cm)`)) + 1))
+shapiro.test(sample(log(bikedata.tf$`Snowfall (cm)` + 
+                          abs(min(bikedata.tf$`Snowfall (cm)`)) + 1), size = 5000))$p.value
+shapiro.test(sample(log(bikedata.tf$`Snowfall (cm)` + 
+                          abs(min(bikedata.tf$`Snowfall (cm)`)) + 1), size = 500))$p.value
+
+# Sqrt transform
+hist(sqrt(bikedata.tf$`Snowfall (cm)` + abs(min(bikedata.tf$`Snowfall (cm)`)) + 1))
+shapiro.test(sample(sqrt(bikedata.tf$`Snowfall (cm)` + 
+                          abs(min(bikedata.tf$`Snowfall (cm)`)) + 1), size = 5000))$p.value
+shapiro.test(sample(sqrt(bikedata.tf$`Snowfall (cm)` + 
+                          abs(min(bikedata.tf$`Snowfall (cm)`)) + 1), size = 500))$p.value
+
+# Inverse
+hist(1/(bikedata.tf$`Snowfall (cm)`))
+shapiro.test(sample(1/(bikedata.tf$`Snowfall (cm)` ), size = 5000))$p.value
+shapiro.test(sample(1/(bikedata.tf$`Snowfall (cm)`), size = 500))$p.value
+```
+And the Snowfall variable.
+```{r PCA}
+bike.pca <- princomp(bikedata.tf[,3:11])
+summary(bike.pca)
+
+bike.pca$loadings[,1]
+
+fviz_pca_var(bike.pca)
+```
+
+We can get peek at what variables are going to have to most effect on what features may explain to most variance in the data. I'm excluding the Date and categorical variables, as they are incompatible with this principal component analysis. I am using the `princomp` function to run the PCA as it is in a package that is already downloaded. I'm using a handy function `fviz_pca_var` to help us visualize the PCA. From the summary, we see that an overwhelming majority of the variance is explained by the first principal component. We also see that the `Hour` variable has a much higher loading value than other features in the data. The visualization of the PCA helps us connect these dots by showing just how dominant the hour variable is in the data. Temperature and Dew Point Temp. are runner ups.
+
+```{r featureEng}
+bikedata$Precipitation <- ifelse(bikedata$`Rainfall(mm)` > 0 | bikedata$`Snowfall (cm)` > 0, 1, 0)
+
+bikedata.tf$Precipitation <- ifelse(bikedata.tf$`Rainfall(mm)` >
+                                      min(bikedata.tf$`Rainfall(mm)`) | 
+                                      bikedata.tf$`Snowfall (cm)` > 
+                                      min(bikedata.tf$`Snowfall (cm)`), 1, 0)
+
+bikedata.en$Precipitation <- ifelse(bikedata.en$`Rainfall(mm)` >
+                                      min(bikedata.en$`Rainfall(mm)`) | 
+                                      bikedata.en$`Snowfall (cm)` > 
+                                      min(bikedata.en$`Snowfall (cm)`), 1, 0)
+```
+I am making a new feature called "precipitation", which is a binary factor variable describing whether there is precipitation or not. Any hour with snowfall or rainfall above 0 will count as a entry with precipitation. 
+
+## Model Construction
+```{r splitData}
+dl <- nrow(bikedata.tf)
+train_inds <- sample(1:dl, size = floor(.8*dl))
+
+ben.train <- bikedata.en[train_inds,]
+ben.test <- bikedata.en[-train_inds,]
+
+btf.train <- bikedata.tf[train_inds,]
+btf.test <- bikedata.tf[-train_inds,]
+```
+I am splitting my data with 80:20 training to testing. I chose this split because it is fairly standard and I will be using different splits later on in Model Tuning & Performance Improvement anyway.
+
+```{r kNNModel}
+# Make Date variable the number of days since 1970
+ben.train$Date <- as.numeric(ben.train$Date) / 86400
+ben.test$Date <- as.numeric(ben.test$Date) / 86400
+
+initial_k <- sqrt(nrow(ben.train))
+knnmodel <- knnreg(ben.train[,-2], ben.train[,2], k = initial_k)
+knnpredictions.en.tf <- predict(knnmodel, ben.test[,-2])
+```
+I am using `knnreg` from the caret package to make my k Nearest Neighbors (kNN) model as it is handy for doing kNN for regression where most handle classification. I am starting with a k of `r initial_k`, as it is the square root of the number of observations in the training data set. I am using the training data set with encoded values for the categorical features.
+
+```{r DTModel}
+dtmodel <- rpart(`Rented Bike Count` ~ ., data = btf.train)
+
+# Make predictions
+dtpredictions.tf <- predict(dtmodel, btf.test[,-2])
+```
+I am using the `rpart` function in the rpart package to create my decision tree model. An alternative package I could use is `RWeka` but I find it less intuitive in the way it handles the data it is given.
+
+```{r MLRegressionModel}
+mlrmodel <- lm(`Rented Bike Count` ~., data = btf.train)
+summary(mlrmodel)
+
+mlrmodel <- lm(`Rented Bike Count` ~. - `Solar Radiation (MJ/m2)` - `Visibility (10m)`, 
+               data = btf.train)
+
+# Model Preview
+summary(mlrmodel)
+
+mlrpredictions.tf <- predict(mlrmodel, btf.test[,-2])
+```
+I am using the base R function `lm` to create my Multiple Linear Regression (MLR) model. The first iteration finds a model to predict RBCs with all other variables in the data. However, some of those variables have low p-values, and may just be noise. I can fix this by re-creating the model, this time without the variables that aren't likely to contribute to accurate predictions.
+
+## Model Evaluation
+
+If we are to evaluate the models, we have a few options. One of them is comparing the R-Squared values for the models. With our models, only one of them is conducive to R-Squared comparisons. We can evaluate the MLR model this way, but we can only compare it to itself using different tuning methods. We can however find the R-Squared values for the correlations between the observed data and predicted data for each model.
+```{r R-sqaured}
+knnRSQ <- cor(ben.test$`Rented Bike Count`, knnpredictions.en.tf) ** 2
+dtRSQ <- cor(btf.test$`Rented Bike Count`, dtpredictions.tf) ** 2
+mlrRSQ <- cor(btf.test$`Rented Bike Count`, mlrpredictions.tf) ** 2
+```
+The R-squared values of the models become lower from the kNN to Decision Tree to Multiple Regression models. They are `r c(knnRSQ, dtRSQ)` and `r mlrRSQ`. Based on these R-squared values, the kNN model performs the best.
+
+The second method of evaluation I will use is Mean Absolute Deviation (MAD). This comparison is possible because it compares the absolute error between the predictions and true values.
+```{r MAD}
+knnMAD <- mean(abs(ben.test$`Rented Bike Count` - knnpredictions.en.tf))
+dtMAD <- mean(abs(btf.test$`Rented Bike Count` - dtpredictions.tf))
+mlrMAD <- mean(abs(btf.test$`Rented Bike Count` - mlrpredictions.tf))
+```
+The smaller the MAD, the more accurate the predictions. The kNN model had the lowest MAD at `r knnMAD`, with the decision tree second at `r dtMAD`, and MLR model last at a highest MAD of `r mlrMAD`.
+
+```{r MSE_RMSE}
+knnRMSE <- sqrt(mean((ben.test$`Rented Bike Count` - knnpredictions.en.tf) ** 2))
+dtRMSE <- sqrt(mean((btf.test$`Rented Bike Count` - dtpredictions.tf) ** 2))
+mlrRMSE <- sqrt(mean((btf.test$`Rented Bike Count` - mlrpredictions.tf) ** 2))
+```
+The smaller the Root Mean Squared Error (RMSE) the better the model. The RMSEs increase from the kNN model to the Decision Tree model to the Multiple Regression model. They are `r knnRMSE`, `r dtRMSE`, and `r mlrRMSE`. This is the same finding as using the MAD.
+
+Comparing the three models using R-squared, MAD, and RMSE metrics, the kNN model performs the best. But, the margins are small, so this order deviate even from small changes in the models. Some changes we can implement are using different k values and K-fold cross validation.
+
+```{r k_tuning}
+ks <- 15
+tuning_MADs <- rep(0, ks)
+
+for (i in 1:ks) {
+  knnmodel_tuning <- knnreg(ben.train[,-2], ben.train[,2], k = i)
+  knnpredictions_tuning <- predict(knnmodel_tuning, ben.test[,-2])
+  tuning_MAD <- mean(abs(ben.test$`Rented Bike Count` - knnpredictions_tuning))
+  tuning_MADs[i] <- tuning_MAD
+}
+plot(tuning_MADs)
+```
+
+For our kNN model, we only explored the use of one k value. Using other k values, we can see how the performance improves. Our initial k value was `r initial_k`, which ended up being much too high. In the above code, we can see that the MAD bottoms out around k of five. This is a good estimate of performance, and we will continue using a k of 5 from now on.
+
+```{r kfold_knn}
+# kNN
+# Establish indexes for data splitting
+enl <- nrow(bikedata.en)
+random_ints <- sample(1:enl, size= enl, replace = FALSE)
+
+# Establish list for MADs for each iteration of splits
+knn_kfold_MADs <- rep(0, 5)
+
+# Correct Date variable type
+bikedata.en$Date <-  as.numeric(bikedata.en$Date) / 86400
+
+# Running kNN with each permutation of data splits
+for (i in 1:5) {
+  if (i == 1) {
+    inds <- random_ints[1:floor(.2*enl)]
+  } else {
+    lower <- (i - 1) * floor(.2*enl)
+    upper <- (i) * floor(.2*enl)
+    inds <- random_ints[lower:upper]
+  }
+  train <- bikedata.en[-inds,]
+  test <- bikedata.en[inds,]
+  model <- knnreg(train[,-2], train[,2], k = 5)
+  preds <- predict(model, test[,-2])
+  mad <- mean(abs(test[,2] - preds))
+  knn_kfold_MADs[i] <- mad
+}
+
+# Find mean amount of MAD values across k-fold splits
+mean_knn_MAD <- mean(knn_kfold_MADs)
+```
+To assess the models using k-fold cross validation, I made a loop to run the kNN model and find predictions for k=5 for neighbors and data splitting. The data was split into 80-20 percent sets for training and testing respectively, and then run to extract the MAD. I'm using the MAD because it is the easiest metric to understand, and it is easy to compare between sets of predictions. The mean MAD for the cross validation was `r mean_knn_MAD`.
+
+```{r kfold_dt}
+# Decision Tree
+# Get new randomizer seed to get new indexes 
+set.seed(23456)
+
+# Establish indexes for data splitting
+tfl <- nrow(bikedata.tf)
+random_ints <- sample(1:tfl, size= tfl, replace = FALSE)
+
+# Establish list for MADs for each iteration of splits
+dt_kfold_MADs <- rep(0, 5)
+
+# Running DT with each permutation of data splits
+for (i in 1:5) {
+  if (i == 1) {
+    inds <- random_ints[1:floor(.2*tfl)]
+  } else {
+    lower <- (i - 1) * floor(.2*tfl)
+    upper <- (i) * floor(.2*tfl)
+    inds <- random_ints[lower:upper]
+  }
+  train <- bikedata.tf[-inds,]
+  test <- bikedata.tf[inds,]
+  model <- rpart(`Rented Bike Count` ~ ., data = train)
+  preds <- predict(model, test[,-2])
+  mad <- mean(unlist(abs(test[,2] - preds)))
+  dt_kfold_MADs[i] <- mad
+}
+
+# Find mean amount of MAD values across k-fold splits
+mean_dt_MAD <- mean(dt_kfold_MADs)
+
+mean_dt_MAD
+```
+With the same k-fold cross validation on the Decision Tree model, we get a mean MAD of `r mean_dt_MAD`.
+
+```{r kfold_mlr}
+# Multiple Regression
+# Get new randomizer seed to get new indexes 
+set.seed(34567)
+
+# Establish indexes for data splitting
+tfl <- nrow(bikedata.tf)
+random_ints <- sample(1:tfl, size= tfl, replace = FALSE)
+
+# Establish list for MADs for each iteration of splits
+mlr_kfold_MADs <- rep(0, 5)
+
+# Running MLR with each permutation of data splits
+for (i in 1:5) {
+  if (i == 1) {
+    inds <- random_ints[1:floor(.2*tfl)]
+  } else {
+    lower <- (i - 1) * floor(.2*tfl)
+    upper <- (i) * floor(.2*tfl)
+    inds <- random_ints[lower:upper]
+  }
+  train <- bikedata.tf[-inds,]
+  test <- bikedata.tf[inds,]
+  model <- lm(`Rented Bike Count` ~ ., data = train)
+  preds <- predict(model, test[,-2])
+  mad <- mean(unlist(abs(test[,2] - preds)))
+  mlr_kfold_MADs[i] <- mad
+}
+
+# Find mean amount of MAD values across k-fold splits
+mean_mlr_MAD <- mean(mlr_kfold_MADs)
+
+mean_mlr_MAD
+```
+And finally with our MLR model, we get a mean MAD of `r mean_mlr_MAD`. Overall, the kNN model is still performing the best, with the Decision Tree second and the Multiple Regression model last. The kNN model has the lowest mean MAD and the multiple regression model has the highest. This is in line with our previous evaluations, and shows that the models didn't different due to sample selection bias.
+
+
+## Model Tuning and Performance Improvement
+
+The models have some variation in their performance, but what if we combined the models into an ensemble? I am going to start by making an ensemble function that makes a prediction using each model and returns the average.
+
+```{r ensemble}
+ensembleFunction <- function(encoded.train, encoded.test, train, test) {
+  # kNN
+  knnmodel.e <- knnreg(encoded.train[,-2], encoded.train[,2], k = 5)
+  knnpreds.e <- predict(knnmodel.e, encoded.test[,-2])
+  
+  # DT
+  dtmodel.e <- rpart(`Rented Bike Count` ~ ., data = train)
+  dtpreds.e <- predict(dtmodel.e, test[,-2])
+  
+  # MLR
+  mlrmodel.e <- lm(`Rented Bike Count` ~ ., data = train)
+  mlrpreds.e <- predict(mlrmodel.e, test[,-2])
+  
+  avg.preds <- (knnpreds.e + dtpreds.e + mlrpreds.e) / 3
+  
+  return(avg.preds)
+}
+```
+
+Now let's run the function so we can compare the predictions it makes.
+```{r ensembleCompare}
+e.predictions <- ensembleFunction(ben.train, ben.test, btf.train, btf.test)
+
+# R-Square
+eRSQ <- cor(btf.test$`Rented Bike Count`, e.predictions) ** 2
+c(eRSQ, knnRSQ, dtRSQ, mlrRSQ)
+
+# MAD
+eMAD <- mean(abs(btf.test$`Rented Bike Count` - e.predictions))
+c(eMAD, knnMAD, dtMAD, mlrMAD)
+
+# RMSE
+eRMSE <- sqrt(mean((btf.test$`Rented Bike Count` - e.predictions) ** 2))
+c(eRMSE, knnRMSE, dtRMSE, mlrRMSE)
+```
+After running the ensemble function to obtain predictions, we can evaluate it with the same metrics we used for each of the models separately. The R-squared value of the ensemble model to the observed values is `r eRSQ`, higher than any of the models alone, which means it is an improvement. The MAD of the ensemble is `r eMAD` and the RMSE is `r eRMSE`. These are both lower than any of the models alone, also indicating improvement. Based on these performance metrics, the ensemble function is a superior method than using any of the models alone.
+
+For all of my evaluations, I calculated the R-squared, MAD, and RMSE for the models with the normalized and transformed values. This doesn't make the metrics any less useful, but it also doesn't show the real life number of Rented Bike Counts that are being predicted. To find the true values of the predictions, one would simply de-transform and de-normalize the data.
+
+Another method of improving our model is bagging. I will use bagging on my decision tree model. The kNN model is considered relatively stable with low variance and won't benefit from re-sampling due to the nature of the model. The Multiple Linear Regression model is also low variance, and will not benefit much either.
+```{r bagging}
+bag <- bagging(
+  formula = `Rented Bike Count` ~ .,
+  data = btf.train,
+  nbagg = 20,   
+  coob = TRUE,
+  control = rpart.control(minsplit = 2, cp = 0)
+)
+
+dtBagPred <- predict(bag, btf.test[,-2])
+
+# R-square
+bagRSQ <- cor(btf.test$`Rented Bike Count`, dtBagPred) ** 2
+c(bagRSQ, dtRSQ)
+
+# MAD
+bagMAD <- mean(abs(btf.test$`Rented Bike Count` - dtBagPred))
+c(bagMAD, dtMAD)
+
+# RMSE
+bagRMSE <- sqrt(mean((btf.test$`Rented Bike Count` - dtBagPred) ** 2))
+c(bagRMSE, dtRMSE)
+```
+When we recreate the Decision tree model, this time with bagging, we see that the model has improved. To make the bagged model, I used 20 iterations of bagging because of limitations set by my personal computer. The `coob` parameter is set to TRUE because I want to estimate the out of bag error as part of the refining of this model. The parameters `minsplit` and `cp` are 2 and 0 respectively so that the trees would be have a good balance between accuracy and comparability to the original DT model. After making the model and predictions, it performs better than the original (it has a higher R-squared, lower MAD and RMSE). This means bagging has improved the model. 
+
+Because bagging improved the model, we can incorporate the bagging model into our ensemble function, and see if the ensemble function improves as well.
+```{r bagIncorporation}
+ensembleFunction <- function(encoded.train, encoded.test, train, test) {
+  # kNN
+  knnmodel.e <- knnreg(encoded.train[,-2], encoded.train[,2], k = 5)
+  knnpreds.e <- predict(knnmodel.e, encoded.test[,-2])
+  
+  # DT
+  dtpreds.e <- predict(bag, test[,-2])
+  
+  # MLR
+  mlrmodel.e <- lm(`Rented Bike Count` ~ ., data = train)
+  mlrpreds.e <- predict(mlrmodel.e, test[,-2])
+  
+  avg.preds <- (knnpreds.e + dtpreds.e + mlrpreds.e) / 3
+  
+  return(avg.preds)
+}
+
+#------------------------------------------------------------#
+# Compare
+bag.e.predictions <- ensembleFunction(ben.train, ben.test, btf.train, btf.test)
+
+# R-Square
+bageRSQ <- cor(btf.test$`Rented Bike Count`, bag.e.predictions) ** 2
+c(bageRSQ, eRSQ)
+
+# MAD
+bageMAD <- mean(abs(btf.test$`Rented Bike Count` - bag.e.predictions))
+c(bageMAD, eMAD)
+
+# RMSE
+bageRMSE <- sqrt(mean((btf.test$`Rented Bike Count` - bag.e.predictions) ** 2))
+c(bageRMSE, eRMSE)
+```
+Using the new bagging model for the decision tree, we improve the ensemble function in all metrics. However, the bagging decision tree model actually performs better than the ensemble function. Changing the weights of the models in the ensemble function could improve the model yet.
+
+```{r ensembleWeighting}
+w.ensembleFunction <- function(encoded.train, encoded.test, train, test) {
+  # kNN
+  knnmodel.e <- knnreg(encoded.train[,-2], encoded.train[,2], k = 5)
+  knnpreds.e <- predict(knnmodel.e, encoded.test[,-2])
+  
+  # DT
+  dtpreds.e <- predict(bag, test[,-2])
+  
+  # MLR
+  mlrmodel.e <- lm(`Rented Bike Count` ~ ., data = train)
+  mlrpreds.e <- predict(mlrmodel.e, test[,-2])
+  
+  avg.preds <- (knnpreds.e + 3 * dtpreds.e + mlrpreds.e) / 5
+  
+  return(avg.preds)
+}
+
+#------------------------------------------------------------#
+# Compare
+wbag.e.predictions <- w.ensembleFunction(ben.train, ben.test, btf.train, btf.test)
+
+# R-Square
+wbageRSQ <- cor(btf.test$`Rented Bike Count`, wbag.e.predictions) ** 2
+c(wbageRSQ, bageRSQ, bagRSQ)
+
+# MAD
+wbageMAD <- mean(abs(btf.test$`Rented Bike Count` - wbag.e.predictions))
+c(wbageMAD, bageMAD, bagMAD)
+
+# RMSE
+wbageRMSE <- sqrt(mean((btf.test$`Rented Bike Count` - wbag.e.predictions) ** 2))
+c(wbageRMSE, bageRMSE, bagRMSE)
+```
+Using an arbitrary weight of 3 for the bagging model of the decision tree within the ensemble model, we get a weighted bagged ensemble model that performs about as good as the bagging decision tree model. Perhaps with more tuning of the ensemble function, we could get it to eclipse the performance of the bagging DT model, but currently it performs well enough.
+
+## References
+Seoul Bike Sharing Demand. (2020). UCI Machine Learning Repository. https://doi.org/10.24432/C5F62R.
+
+
+
